@@ -115,6 +115,20 @@ uint32_t SSS_fp_recombine(uint32_t *shares, const uint32_t *ids, uint32_t t, uin
     return s;
 }
 
+void SSS_fp_calc_l(uint32_t *lag, const uint32_t *ids, uint32_t t, uint32_t p)
+{
+    for (uint32_t i = 0; i < t; i++) {
+        uint32_t l = 1;
+        for (uint32_t j = 0; j < t; j++) {
+            if (j == i) {
+                continue;
+            }
+            l = ((uint64_t)l * (((uint64_t)ids[j] * inv_mod((int64_t)ids[j] - ids[i], p)) % p)) % p;
+        }
+        lag[i] = l;
+    }
+}
+
 
 void PQS_threshold_keygen_gf2(vk_t &vk, sk_t *sk, const uint32_t *ids, uint32_t tt, uint32_t n, uint32_t mod){
 	uint32_t i,j;
@@ -293,12 +307,12 @@ void PQS_threshold_keygen_fp(vk_t &vk, sk_t *sk, const uint32_t *ids, uint32_t t
         }
     }
 
-    std::cout << "------------ CHECK :: VECTOR s1 ------------" << std::endl;
+    /*std::cout << "------------ CHECK :: VECTOR s1 ------------" << std::endl;
 	for(i=0; i<PQS_l; i++){
 		std::cout << "s[" << i << "] = ";
 		print_polystruct(sk1.s.polynomial[i], PQS_n, PQS_q);
 	}
-    std::cout << std::endl;
+    std::cout << std::endl;*/
 	    
     /*std::cout << "------------ PUBLIC KEY :: VECTOR t -------------" << std::endl;
 	for(i=0; i<PQS_k; i++){
@@ -325,7 +339,7 @@ void PQS_threshold_keygen_fp(vk_t &vk, sk_t *sk, const uint32_t *ids, uint32_t t
 
 #define crh(OUT, IN, INBYTES) shake256(OUT, CRHBYTES, IN, INBYTES)
 
-void PQS_threshold_sign(signat_t &sig, const unsigned char *m, uint32_t mlen, sk_t &sk, vk_t &vk){
+void PQS_threshold_sign(signat_t &sig, const unsigned char *m, uint32_t mlen, sk_t *sk_shares, vk_t &vk, const uint32_t *ids, uint32_t tt, uint32_t p){
 	uint32_t i, j;
 	unsigned char seed[SEEDBYTES];
 	uint8_t mu[CRHBYTES];
@@ -342,76 +356,72 @@ void PQS_threshold_sign(signat_t &sig, const unsigned char *m, uint32_t mlen, sk
 	sgn:
 	GenSeed(seed);
 	// Generate intermediate vector y
-	polyvecl y;
-	GenSecret_y(y, seed);
-	
-	#ifdef DEBUG_MODE
-	// Show vector y (l polynomials)
-	cerr << "------------ SIGNING PROCEDURE :: VECTOR y -------------" << endl;
-	for(int k=0; k<PQS_l; k++){
-		cerr << "y[" << k << "] = ";
-		print_polystruct(y.polynomial[k], PQS_n, PQS_q);
-	}
-	#endif
-	
+
+	polyvecl y[tt];
+	for (i = 0; i < tt; i++) {
+        GenSecret_y(y[i], seed);
+    }
+	uint32_t lag[tt];
+    SSS_fp_calc_l(lag, ids, tt, p);
+
+    for (uint32_t us = 0; us < tt; us++){
+        for(j=0; j<PQS_l; j++){
+            for(i=0; i<PQS_n; i++){
+                uint64_t l_inv = inv_mod(lag[us], p);
+                y[us].polynomial[j].coeffs[i] = (y[us].polynomial[j].coeffs[i] * l_inv) % p;
+            }
+        }
+    }
+
 	// Prepare w=MSB(A*y, d)
-	polyveck w;
-	matrixpoly(matA, y, w);
+	polyveck w[tt];
+    for (i = 0; i < tt; i++) {
+        matrixpoly(matA, y[i], w[i]);
+    }
 	
-	#ifdef DEBUG_MODE
-	// Show vector w (k polynomials)
-	cerr << "------------ SIGNING PROCEDURE :: VECTOR A*y -------------" << endl;
-	for(int k=0; k<PQS_k; k++){
-		cerr << "A*y[" << k << "] = ";
-		print_polystruct(w.polynomial[k], PQS_n, PQS_q);
-	}
-	#endif
-	
-	for(j=0; j<PQS_k; j++)
-		for(i=0; i<PQS_n; i++){
-			w.polynomial[j].coeffs[i] = MSB(w.polynomial[j].coeffs[i], PQS_d);
-		}
-	
-	#ifdef DEBUG_MODE
-	// Show vector w (k polynomials)
-	cerr << "------------ SIGNING PROCEDURE :: VECTOR MSB(A*y) -------------" << endl;
-	for(int k=0; k<PQS_k; k++){
-		cerr << "w[" << k << "] = ";
-		print_polystruct(w.polynomial[k], PQS_n, PQS_q);
-	}
-	#endif
+    polyveck w_total = {0};
+    
+    for(j=0; j<PQS_k; j++){
+        for(i=0; i<PQS_n; i++){
+            w_total.polynomial[j].coeffs[i] = 0;
+            for (uint32_t us = 0; us < tt; us++){
+                w_total.polynomial[j].coeffs[i] += w[us].polynomial[j].coeffs[i];
+            }
+            w_total.polynomial[j].coeffs[i] &= (PQS_q-1);
+            w_total.polynomial[j].coeffs[i] = MSB(w_total.polynomial[j].coeffs[i], PQS_d);
+        }
+    }
 	
 	// CRH(m) -> mu
 	memset(mu, 0, sizeof(uint8_t)*CRHBYTES);
 	crh(mu, m, mlen);
-	#ifdef DEBUG_MODE
-	// Show a hash mu
-	cerr << "------------ SIGNING PROCEDURE :: CRH(Message) -------------" << endl;
-	for(int k=0; k<CRHBYTES; k++){
-		cerr << mu[k] << " ";
-	}
-	cerr << endl;
-	#endif	
 	
 	// Generate polynomial c
-	challenge(sig.c, &mu[0], w);
+	challenge(sig.c, &mu[0], w_total);
 	
-	#ifdef DEBUG_MODE
-	// Show polynomial c (challenge)
-	cerr << "------------ SIGNING PROCEDURE :: POLYNOMIAL c -------------" << endl;
-		print_polystruct(sig.c, PQS_n, PQS_q);
-	#endif
-	
+    polyvecl z[tt] = {0};
 	// Calculate z
-	for(i=0; i<PQS_l; i++){
-		POLYMUL_MODE(sk.s.polynomial[i], sig.c, sig.z.polynomial[i], PQS_n, PQS_q);
-		// add y[i] to z[i]
-		for(j=0; j<PQS_n; j++){
-			sig.z.polynomial[i].coeffs[j] += y.polynomial[i].coeffs[j];
-			sig.z.polynomial[i].coeffs[j] &= (PQS_q - 1); // Reduce modulo q
-		}
-	}
+    for (uint32_t us = 0; us < tt; us++){
+        for(i=0; i<PQS_l; i++){
+            POLYMUL_MODE(sk_shares[us].s.polynomial[i], sig.c, z[us].polynomial[i], PQS_n, PQS_q);
+            // add y[i] to z[i]
+            for(j=0; j<PQS_n; j++){
+                z[us].polynomial[i].coeffs[j] += y[us].polynomial[i].coeffs[j];
+                z[us].polynomial[i].coeffs[j] &= (PQS_q - 1); // Reduce modulo q
+            }
+        }
+    }
 	
+    for(i=0; i<PQS_l; i++){
+        for(j=0; j<PQS_n; j++){
+            sig.z.polynomial[i].coeffs[j] = 0;
+            for (uint32_t us = 0; us < tt; us++){
+                sig.z.polynomial[i].coeffs[j] += z[us].polynomial[i].coeffs[j];
+            }
+            sig.z.polynomial[i].coeffs[j] &= (PQS_q - 1);
+        }
+    }
+
 	#ifdef DEBUG_MODE
 	// Show vector z (l polynomials)
 	cerr << "------------ SIGNING PROCEDURE :: VECTOR z -------------" << endl;
@@ -422,15 +432,15 @@ void PQS_threshold_sign(signat_t &sig, const unsigned char *m, uint32_t mlen, sk
 	#endif
 	
 	// Calculate w (memory is already allocated, we don't need old w anymore
-	matrixpoly(matA, sig.z, w);
+	matrixpoly(matA, sig.z, w_total);
 	
 	poly subpoly;
 	for(i=0; i<PQS_k; i++){
 		POLYMUL_MODE(vk.t.polynomial[i], sig.c, subpoly, PQS_n, PQS_q);
 		for(j=0; j<PQS_n; j++){
 			subpoly.coeffs[j] *= mod;
-			w.polynomial[i].coeffs[j] -= subpoly.coeffs[j];
-			w.polynomial[i].coeffs[j] &= (PQS_q-1);
+			w_total.polynomial[i].coeffs[j] -= subpoly.coeffs[j];
+			w_total.polynomial[i].coeffs[j] &= (PQS_q-1);
 		}
 	}
 	
@@ -445,7 +455,7 @@ void PQS_threshold_sign(signat_t &sig, const unsigned char *m, uint32_t mlen, sk
 	
 	for(i=0; i<PQS_k; i++){ // Check w norm bound
 		for(j=0; j<PQS_n; j++){
-			w1 = LSB(w.polynomial[i].coeffs[j], PQS_nu-PQS_d);
+			w1 = LSB(w_total.polynomial[i].coeffs[j], PQS_nu-PQS_d);
 			w1 -= (delta1 + 1);
 			if(w1 >= bound1){
 				//cerr << "PQS_sign() RESTARTING (bad w) ... " << endl;
@@ -539,6 +549,52 @@ void test_PQS_threshold_keygen()
     }
 }
 
+void test_PQS_threshold_sign()
+{
+    uint32_t t = 3;
+    uint32_t n = 5;
+    uint32_t p = 4294967291;
+
+    vk_t vk;
+    sk_t sk_shares[n];
+    uint32_t ids[n] = {0};
+
+    for (uint32_t i = 0; i < n; i++) {
+        ids[i] = i + 1;
+    }
+
+    PQS_threshold_keygen_fp(vk, sk_shares, ids, t, n, p);
+    
+    uint32_t shares_ind[t] = {0, 4, 1};
+    uint32_t ids1[t];
+    for (uint32_t i = 0; i < t; i++) {
+        ids1[i] = ids[shares_ind[i]];
+    }
+
+    sk_t sk_shares1[t];
+    for (uint32_t i = 0; i < t; i++) {
+        sk_shares1[i] = sk_shares[shares_ind[i]];
+    }
+    
+    /*std::cout << "------------ SECRET KEY :: VECTOR s ------------" << std::endl;
+	for(uint32_t i=0; i<PQS_l; i++){
+		std::cout << "s[" << i << "] = ";
+		print_polystruct(sk.s.polynomial[i], PQS_n, PQS_q);
+	}
+    std::cout << std::endl;*/
+
+    unsigned char m[] = "My test message";
+    signat_t sig;
+    PQS_threshold_sign(sig, &m[0], sizeof(m), sk_shares1, vk, ids1, t, p);
+    
+    bool success = PQS_verify(sig, &m[0], sizeof(m), vk);
+    if(success){
+        std::cout << "Verify Ok" << std::endl;
+    } else {
+        std::cout << "Verify fail" << std::endl;
+    }
+}
+
 void test_gf2() 
 {
 /*
@@ -581,7 +637,7 @@ while(i < 1<<24):
 
 int main()
 {
-    test_PQS_threshold_keygen();
+    test_PQS_threshold_sign();
 
     return 0;
 }
